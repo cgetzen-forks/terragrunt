@@ -1,0 +1,4 @@
+inputs = {
+  message = values.message
+}
+

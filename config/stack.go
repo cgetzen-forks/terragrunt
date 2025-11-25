@@ -17,6 +17,7 @@ import (
 
 	"github.com/hashicorp/go-getter/v2"
 
+	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 
 	"github.com/gruntwork-io/terragrunt/util"
@@ -54,22 +55,29 @@ type StackConfig struct {
 
 // Unit represents unit from a stack file.
 type Unit struct {
-	NoStack      *bool      `hcl:"no_dot_terragrunt_stack,attr"`
-	NoValidation *bool      `hcl:"no_validation,attr"`
-	Values       *cty.Value `hcl:"values,attr"`
-	Name         string     `hcl:",label"`
-	Source       string     `hcl:"source,attr"`
-	Path         string     `hcl:"path,attr"`
+	NoStack          *bool             `hcl:"no_dot_terragrunt_stack,attr"`
+	NoValidation     *bool             `hcl:"no_validation,attr"`
+	Values           *cty.Value        `hcl:"values,attr"`
+	MockOutputs      *cty.Value        `hcl:"mock_outputs,attr"`
+	Name             string            `hcl:",label"`
+	Source           string            `hcl:"source,attr"`
+	Path             string            `hcl:"path,attr"`
+	ValuesExpr       hcl.Expression    // Raw HCL expression for values (not populated by hcl tag)
+	UnitDependencies *UnitDependencies // Dependencies extracted from values expressions
+	SourceBytes      []byte            // Source bytes of the stack file (for expression rewriting)
 }
 
 // Stack represents the stack block in the configuration.
 type Stack struct {
-	NoStack      *bool      `hcl:"no_dot_terragrunt_stack,attr"`
-	NoValidation *bool      `hcl:"no_validation,attr"`
-	Values       *cty.Value `hcl:"values,attr"`
-	Name         string     `hcl:",label"`
-	Source       string     `hcl:"source,attr"`
-	Path         string     `hcl:"path,attr"`
+	NoStack          *bool             `hcl:"no_dot_terragrunt_stack,attr"`
+	NoValidation     *bool             `hcl:"no_validation,attr"`
+	Values           *cty.Value        `hcl:"values,attr"`
+	Name             string            `hcl:",label"`
+	Source           string            `hcl:"source,attr"`
+	Path             string            `hcl:"path,attr"`
+	ValuesExpr       hcl.Expression    // Raw HCL expression for values (not populated by hcl tag)
+	UnitDependencies *UnitDependencies // Dependencies extracted from values expressions
+	SourceBytes      []byte            // Source bytes of the stack file (for expression rewriting)
 }
 
 // GenerateStackFile generates the Terragrunt stack configuration from the given stackFilePath,
@@ -90,7 +98,15 @@ func GenerateStackFile(ctx context.Context, l log.Logger, opts *options.Terragru
 
 	stackTargetDir := filepath.Join(stackSourceDir, StackDir)
 
-	if err := generateUnits(ctx, l, opts, pool, stackFilePath, stackSourceDir, stackTargetDir, stackFile.Units); err != nil {
+	// Create a map of unit names to their mock outputs for dependency generation
+	unitMockOutputs := make(map[string]*cty.Value)
+	for _, unit := range stackFile.Units {
+		if unit.MockOutputs != nil {
+			unitMockOutputs[unit.Name] = unit.MockOutputs
+		}
+	}
+
+	if err := generateUnits(ctx, l, opts, pool, stackFilePath, stackSourceDir, stackTargetDir, stackFile.Units, unitMockOutputs); err != nil {
 		return err
 	}
 
@@ -104,19 +120,23 @@ func GenerateStackFile(ctx context.Context, l log.Logger, opts *options.Terragru
 // generateUnits iterates through a slice of Unit objects, generating each one by copying
 // source files to their destination paths and writing unit-specific values.
 // It logs the generating progress and returns any errors encountered during the operation.
-func generateUnits(ctx context.Context, l log.Logger, opts *options.TerragruntOptions, pool *worker.Pool, sourceFile, sourceDir, targetDir string, units []*Unit) error {
+func generateUnits(ctx context.Context, l log.Logger, opts *options.TerragruntOptions, pool *worker.Pool, sourceFile, sourceDir, targetDir string, units []*Unit, unitMockOutputs map[string]*cty.Value) error {
 	for _, unit := range units {
 		pool.Submit(func() error {
 			item := componentToGenerate{
-				sourceDir:    sourceDir,
-				targetDir:    targetDir,
-				name:         unit.Name,
-				path:         unit.Path,
-				source:       unit.Source,
-				values:       unit.Values,
-				noStack:      unit.NoStack != nil && *unit.NoStack,
-				noValidation: unit.NoValidation != nil && *unit.NoValidation,
-				kind:         unitKind,
+				sourceDir:        sourceDir,
+				targetDir:        targetDir,
+				name:             unit.Name,
+				path:             unit.Path,
+				source:           unit.Source,
+				values:           unit.Values,
+				valuesExpr:       unit.ValuesExpr,
+				unitDependencies: unit.UnitDependencies,
+				unitMockOutputs:  unitMockOutputs,
+				sourceBytes:      unit.SourceBytes,
+				noStack:          unit.NoStack != nil && *unit.NoStack,
+				noValidation:     unit.NoValidation != nil && *unit.NoValidation,
+				kind:             unitKind,
 			}
 
 			l.Infof("Generating unit %s from %s", unit.Name, sourceFile)
@@ -141,15 +161,18 @@ func generateStacks(ctx context.Context, l log.Logger, opts *options.TerragruntO
 	for _, stack := range stacks {
 		pool.Submit(func() error {
 			item := componentToGenerate{
-				sourceDir:    sourceDir,
-				targetDir:    targetDir,
-				name:         stack.Name,
-				path:         stack.Path,
-				source:       stack.Source,
-				noStack:      stack.NoStack != nil && *stack.NoStack,
-				noValidation: stack.NoValidation != nil && *stack.NoValidation,
-				values:       stack.Values,
-				kind:         stackKind,
+				sourceDir:        sourceDir,
+				targetDir:        targetDir,
+				name:             stack.Name,
+				path:             stack.Path,
+				source:           stack.Source,
+				noStack:          stack.NoStack != nil && *stack.NoStack,
+				noValidation:     stack.NoValidation != nil && *stack.NoValidation,
+				values:           stack.Values,
+				valuesExpr:       stack.ValuesExpr,
+				unitDependencies: stack.UnitDependencies,
+				sourceBytes:      stack.SourceBytes,
+				kind:             stackKind,
 			}
 
 			l.Infof("Generating stack %s from %s", stack.Name, sourceFile)
@@ -179,15 +202,19 @@ const (
 // It contains information about the source and target directories, the name and path of the item, the source URL or path,
 // and any associated values that need to be generated.
 type componentToGenerate struct {
-	values       *cty.Value
-	sourceDir    string
-	targetDir    string
-	name         string
-	path         string
-	source       string
-	noStack      bool
-	noValidation bool
-	kind         componentKind
+	values           *cty.Value
+	valuesExpr       hcl.Expression
+	unitDependencies *UnitDependencies
+	unitMockOutputs  map[string]*cty.Value // Map of unit name -> mock outputs for dependency generation
+	sourceBytes      []byte
+	sourceDir        string
+	targetDir        string
+	name             string
+	path             string
+	source           string
+	noStack          bool
+	noValidation     bool
+	kind             componentKind
 }
 
 // generateComponent copies files from the source directory to the target destination and generates a corresponding values file.
@@ -287,7 +314,7 @@ func generateComponent(ctx context.Context, l log.Logger, opts *options.Terragru
 	}
 
 	// generate values file
-	if err := writeValues(l, cmp.values, dest); err != nil {
+	if err := writeValuesWithDependencies(l, cmp.values, cmp.valuesExpr, cmp.unitDependencies, cmp.unitMockOutputs, cmp.sourceBytes, cmp.targetDir, dest); err != nil {
 		return errors.Errorf("failed to write values %v %w", cmp.name, err)
 	}
 
@@ -445,7 +472,7 @@ func ParseStackConfig(l log.Logger, parser *ParsingContext, opts *options.Terrag
 		return nil, errors.New(err)
 	}
 	//nolint:contextcheck
-	evalParsingContext, err := createTerragruntEvalContext(parser, l, file.ConfigPath)
+	evalParsingContext, err := createStackEvalContext(parser, l, file.ConfigPath, file.File)
 	if err != nil {
 		return nil, errors.New(err)
 	}
@@ -453,6 +480,11 @@ func ParseStackConfig(l log.Logger, parser *ParsingContext, opts *options.Terrag
 	config := &StackConfigFile{}
 	if decodeErr := file.Decode(config, evalParsingContext); decodeErr != nil {
 		return nil, errors.New(decodeErr)
+	}
+
+	// Extract raw expressions and scan for unit references
+	if err := extractAndProcessUnitReferences(file.File, config); err != nil {
+		return nil, errors.New(err)
 	}
 
 	localsParsed := map[string]any{}
@@ -541,6 +573,32 @@ func writeValues(l log.Logger, values *cty.Value, directory string) error {
 	return nil
 }
 
+// writeValuesWithDependencies generates and writes values to a terragrunt.values.hcl file.
+// When there are unit dependencies, it writes dependency blocks and a values block with
+// rewritten expressions that reference dependency.*.outputs.*.
+func writeValuesWithDependencies(l log.Logger, values *cty.Value, valuesExpr hcl.Expression, unitDeps *UnitDependencies, unitMockOutputs map[string]*cty.Value, sourceBytes []byte, stackTargetDir, directory string) error {
+	// If there are no unit dependencies, use the simple writeValues
+	if unitDeps == nil || len(unitDeps.Dependencies) == 0 {
+		return writeValues(l, values, directory)
+	}
+
+	// Generate terragrunt.values.hcl with dependency blocks and values block
+	return writeValuesWithDependencyBlocks(l, valuesExpr, unitDeps, unitMockOutputs, sourceBytes, stackTargetDir, directory)
+}
+
+// valuesBlock represents the values block in a terragrunt.values.hcl file.
+type valuesBlock struct {
+	Remain hcl.Body `hcl:",remain"`
+}
+
+// valuesFileWithDependencies is a struct for parsing terragrunt.values.hcl files
+// that contain dependency blocks and a values block.
+type valuesFileWithDependencies struct {
+	Dependencies Dependencies `hcl:"dependency,block"`
+	ValuesBlock  *valuesBlock `hcl:"values,block"`
+	Remain       hcl.Body     `hcl:",remain"`
+}
+
 // ReadValues reads values from the terragrunt.values.hcl file in the specified directory.
 func ReadValues(ctx context.Context, l log.Logger, opts *options.TerragruntOptions, directory string) (*cty.Value, error) {
 	if directory == "" {
@@ -560,12 +618,57 @@ func ReadValues(ctx context.Context, l log.Logger, opts *options.TerragruntOptio
 	if err != nil {
 		return nil, errors.New(err)
 	}
+
+	// First, try to decode dependency blocks (if any)
 	//nolint:contextcheck
 	evalParsingContext, err := createTerragruntEvalContext(parser, l, file.ConfigPath)
 	if err != nil {
 		return nil, errors.New(err)
 	}
 
+	// Decode dependencies first (without evaluating values yet)
+	valuesWithDeps := valuesFileWithDependencies{}
+	if err := file.Decode(&valuesWithDeps, evalParsingContext); err == nil && len(valuesWithDeps.Dependencies) > 0 {
+		// If we're in a context where we should skip outputs resolution (e.g., during dependency discovery),
+		// return nil to avoid trying to evaluate dependencies that haven't been applied yet
+		if opts.SkipOutput {
+			l.Debugf("Skipping values evaluation due to SkipOutput flag")
+			return nil, nil
+		}
+
+		// File has dependency blocks - need to evaluate them and add to context
+		//nolint:contextcheck
+		dependenciesVal, err := dependencyBlocksToCtyValue(parser, l, valuesWithDeps.Dependencies)
+		if err != nil {
+			return nil, errors.New(err)
+		}
+
+		// Create new eval context with dependencies
+		evalParsingContext.Variables["dependency"] = *dependenciesVal
+
+		// Now decode the values block with dependencies available
+		if valuesWithDeps.ValuesBlock != nil {
+			// Decode the values block as a map of attributes
+			attrs, diags := valuesWithDeps.ValuesBlock.Remain.JustAttributes()
+			if diags.HasErrors() {
+				return nil, errors.New(diags)
+			}
+
+			values := map[string]cty.Value{}
+			for name, attr := range attrs {
+				val, diags := attr.Expr.Value(evalParsingContext)
+				if diags.HasErrors() {
+					return nil, errors.New(diags)
+				}
+				values[name] = val
+			}
+
+			result := cty.ObjectVal(values)
+			return &result, nil
+		}
+	}
+
+	// Fall back to old format (top-level attributes)
 	values := map[string]cty.Value{}
 
 	if err := file.Decode(&values, evalParsingContext); err != nil {
