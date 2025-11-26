@@ -98,15 +98,7 @@ func GenerateStackFile(ctx context.Context, l log.Logger, opts *options.Terragru
 
 	stackTargetDir := filepath.Join(stackSourceDir, StackDir)
 
-	// Create a map of unit names to their mock outputs for dependency generation
-	unitMockOutputs := make(map[string]*cty.Value)
-	for _, unit := range stackFile.Units {
-		if unit.MockOutputs != nil {
-			unitMockOutputs[unit.Name] = unit.MockOutputs
-		}
-	}
-
-	if err := generateUnits(ctx, l, opts, pool, stackFilePath, stackSourceDir, stackTargetDir, stackFile.Units, unitMockOutputs); err != nil {
+	if err := generateUnits(ctx, l, opts, pool, stackFilePath, stackSourceDir, stackTargetDir, stackFile.Units); err != nil {
 		return err
 	}
 
@@ -120,7 +112,15 @@ func GenerateStackFile(ctx context.Context, l log.Logger, opts *options.Terragru
 // generateUnits iterates through a slice of Unit objects, generating each one by copying
 // source files to their destination paths and writing unit-specific values.
 // It logs the generating progress and returns any errors encountered during the operation.
-func generateUnits(ctx context.Context, l log.Logger, opts *options.TerragruntOptions, pool *worker.Pool, sourceFile, sourceDir, targetDir string, units []*Unit, unitMockOutputs map[string]*cty.Value) error {
+func generateUnits(ctx context.Context, l log.Logger, opts *options.TerragruntOptions, pool *worker.Pool, sourceFile, sourceDir, targetDir string, units []*Unit) error {
+	// Create a map of unit names to their mock outputs for dependency generation
+	unitMockOutputs := make(map[string]*cty.Value)
+	for _, unit := range units {
+		if unit.MockOutputs != nil {
+			unitMockOutputs[unit.Name] = unit.MockOutputs
+		}
+	}
+
 	for _, unit := range units {
 		pool.Submit(func() error {
 			item := componentToGenerate{
